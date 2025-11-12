@@ -1,16 +1,17 @@
 # main.py
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
-import re
+import re, requests, tempfile
 from imdb import IMDb
 
 ia = IMDb()
 
-app = FastAPI(title="IMDb Mini API", version="1.0")
+app = FastAPI(title="IMDb Mini API", version="2.0")
 
-# Enable CORS for frontend use
+# Enable CORS for public use
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,6 +20,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ============================
+# 📦 MODELS
+# ============================
 
 class SearchResult(BaseModel):
     title: str
@@ -28,31 +32,58 @@ class SearchResult(BaseModel):
     poster: Optional[str]
 
 
+# ============================
+# 🔍 /search  (fixed endpoint)
+# ============================
+
 @app.get("/search", response_model=List[SearchResult])
 def search(q: str = Query(..., min_length=1), limit: int = 10):
-    """Search movies by name; returns up to limit results."""
+    """
+    Search IMDb titles by name.
+    Uses IMDb's public mobile JSON suggestion API.
+    """
     try:
-        results = ia.search_movie(q)
+        url = f"https://v2.sg.media-imdb.com/suggestion/{q[0].lower()}/{q}.json"
+        resp = requests.get(url, timeout=10)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=500, detail="IMDb API error")
+        data = resp.json()
+        results = data.get("d", [])
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
     out = []
-    for movie in results[:limit]:
-        imdb_id = f"tt{movie.movieID}"
-        title = movie.get('title')
-        year = movie.get('year')
-        kind = movie.get('kind')
-        poster = (
-            movie.get('full-size cover url')
-            or movie.get('cover url')
-            or movie.get('cover')
+    for item in results[:limit]:
+        title = item.get("l")
+        year = item.get("y")
+        imdb_id = item.get("id")
+        kind = item.get("qid") or item.get("q") or "movie"
+        poster = None
+        if "i" in item:
+            # item["i"] can be list or dict
+            if isinstance(item["i"], list):
+                poster = item["i"][0]
+            elif isinstance(item["i"], dict):
+                poster = item["i"].get("imageUrl")
+        out.append(
+            SearchResult(
+                title=title or "",
+                year=year,
+                imdb_id=imdb_id or "",
+                kind=kind,
+                poster=poster,
+            )
         )
-        out.append(SearchResult(title=title or "", year=year, imdb_id=imdb_id, kind=kind, poster=poster))
+    if not out:
+        raise HTTPException(status_code=404, detail="No results found.")
     return out
 
 
+# ============================
+# 🎬 /movie/{imdb_id}
+# ============================
+
 def _get_movie_by_imdb_id(imdb_id: str) -> Dict[str, Any]:
-    """Fetch movie details using imdb_id like 'tt0133093'"""
     movie_id = imdb_id[2:] if imdb_id.startswith("tt") else imdb_id
     try:
         movie = ia.get_movie(movie_id)
@@ -83,7 +114,6 @@ def movie_details(imdb_id: str):
         plot = sget("plot")[0]
     languages = sget("languages") or []
     countries = sget("countries") or []
-    aka = sget("akas") or []
     poster = (
         sget("full-size cover url")
         or sget("cover url")
@@ -130,14 +160,21 @@ def movie_details(imdb_id: str):
     return response
 
 
-TAG_PATTERN = re.compile(r"#([A-Z0-9_]+)|{([^}]+)}")
+# ============================
+# 🧩 /render
+# ============================
 
+TAG_PATTERN = re.compile(r"#([A-Z0-9_]+)|{([^}]+)}")
 
 @app.get("/render")
 def render_template(
     imdb_id: str = Query(...), template: str = Query(..., min_length=1)
 ):
-    """Render a user template replacing supported tags."""
+    """
+    Replace supported tags in a custom template.
+    Example:
+      /render?imdb_id=tt7838252&template=%23TITLE%20(%23YEAR)%20-%20%7BIMG_POSTER%7D
+    """
     movie_resp = movie_details(imdb_id)
     tags = movie_resp["tags"]
 
@@ -156,6 +193,39 @@ def render_template(
     return {"rendered": rendered}
 
 
+# ============================
+# 🖼 /poster/{imdb_id}
+# ============================
+
+@app.get("/poster/{imdb_id}")
+def get_poster(imdb_id: str):
+    """Download and return poster image"""
+    movie = _get_movie_by_imdb_id(imdb_id)
+    poster = (
+        movie.get("full-size cover url")
+        or movie.get("cover url")
+        or movie.get("cover")
+    )
+    if not poster:
+        raise HTTPException(status_code=404, detail="No poster found")
+    r = requests.get(poster, stream=True)
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail="Poster fetch failed")
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+    for chunk in r.iter_content(1024):
+        tmp.write(chunk)
+    tmp.close()
+    return FileResponse(tmp.name, media_type="image/jpeg", filename=f"{imdb_id}.jpg")
+
+
+# ============================
+# 🏠 Root
+# ============================
+
 @app.get("/")
 def root():
-    return {"ok": True, "message": "IMDb Mini API. Visit /docs for Swagger UI."}
+    return {
+        "ok": True,
+        "message": "IMDb Mini API (v2). Endpoints: /search, /movie/{id}, /render, /poster/{id}, /docs"
+    }
